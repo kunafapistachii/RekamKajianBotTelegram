@@ -208,8 +208,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
 
         except Exception as exc:  # noqa: BLE001 — catch-all for Telegram reply
-            log.exception("Unexpected error")
-            await msg.reply_text(f"⚠️ Error tidak terduga: {exc}")
+            log.exception("Unexpected error: %s", exc)
+            await msg.reply_text(f"⚠️ Error tidak terduga ({type(exc).__name__}): {exc}")
 
 
 # ---------------------------------------------------------------------------

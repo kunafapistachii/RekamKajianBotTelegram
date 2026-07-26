@@ -40,6 +40,8 @@ services:
       AUDIO_BITRATE: ${AUDIO_BITRATE:-48k}
       AUDIO_CHANNELS: ${AUDIO_CHANNELS:-1}
       OUTPUT_EXT: ${OUTPUT_EXT:-opus}
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
     depends_on:
       - telegram-bot-api
     restart: unless-stopped
