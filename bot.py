@@ -19,6 +19,7 @@ from pathlib import Path
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -236,6 +237,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             )
             return ConversationHandler.END
 
+        except TimedOut as exc:
+            log.warning("Telegram API TimedOut during file processing: %s", exc)
+            await status_msg.edit_text("⚠️ Proses timeout (koneksi lambat). Silakan kirim ulang audio kamu.")
+            return ConversationHandler.END
+
         except Exception as exc:
             log.exception("Unexpected error: %s", exc)
             await status_msg.edit_text(f"⚠️ Error tidak terduga ({type(exc).__name__}): {exc}")
@@ -399,6 +405,10 @@ def main() -> None:
         .base_url(f"{LOCAL_API_URL}/bot")
         .base_file_url(f"{LOCAL_API_URL}/file/bot")
         .local_mode(True)
+        .read_timeout(300)
+        .write_timeout(300)
+        .connect_timeout(60)
+        .pool_timeout(60)
         .build()
     )
 
