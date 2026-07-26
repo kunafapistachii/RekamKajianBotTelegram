@@ -187,6 +187,48 @@ def wp_create_post(title: str, media_id: int, media_url: str, category_ids: list
     return resp.json()["link"]
 
 
+def get_books_keyboard(syaikh_filter_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    """Build keyboard showing list of Books directly by default."""
+    try:
+        categories = wp_get_categories()
+        cat_map = {c["id"]: c for c in categories}
+        books = [c for c in categories if c["parent"] != 0]
+
+        if syaikh_filter_id:
+            books = [b for b in books if b["parent"] == syaikh_filter_id]
+            syaikh_name = cat_map.get(syaikh_filter_id, {}).get("name", "Syaikh")
+            heading = f"📖 Pilih Buku (Filter: **{syaikh_name}**):"
+        else:
+            heading = "📖 Pilih Buku untuk postingan kajian ini:"
+
+        keyboard = []
+        for b in books:
+            parent_name = cat_map.get(b["parent"], {}).get("name", "Umum")
+            label = f"📖 {b['name']} ({parent_name})"
+            keyboard.append([InlineKeyboardButton(label[:50], callback_data=f"cat_set_{b['id']}_{b['parent']}")])
+
+        # Action row for filtering & adding
+        action_row = []
+        if syaikh_filter_id:
+            action_row.append(InlineKeyboardButton("📚 Semua Buku", callback_data="cat_show_all_books"))
+        else:
+            action_row.append(InlineKeyboardButton("👤 Filter per Syaikh", callback_data="cat_filter_syaikh"))
+
+        action_row.append(InlineKeyboardButton("➕ Buku Baru", callback_data="cat_new_book"))
+        keyboard.append(action_row)
+
+        keyboard.append([InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")])
+
+        return heading, InlineKeyboardMarkup(keyboard)
+    except Exception as exc:
+        log.exception("Failed to build books keyboard: %s", exc)
+        keyboard = [
+            [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data="cat_new_book")],
+            [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")],
+        ]
+        return "Pilih opsi kategori:", InlineKeyboardMarkup(keyboard)
+
+
 # ---------------------------------------------------------------------------
 # Telegram Handlers
 # ---------------------------------------------------------------------------
@@ -224,14 +266,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "title": title,
             }
 
-            keyboard = [
-                [InlineKeyboardButton("📚 Pilih Buku Existing", callback_data="cat_select_book")],
-                [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data="cat_new_book")],
-                [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            heading, reply_markup = get_books_keyboard()
             await status_msg.edit_text(
-                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n\nPilih kategori kajian untuk postingan ini:",
+                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n\n{heading}",
                 reply_markup=reply_markup,
                 parse_mode="Markdown",
             )
@@ -268,34 +305,32 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.pop("pending_post", None)
         return ConversationHandler.END
 
-    elif data == "cat_select_book":
+    elif data == "cat_show_all_books":
+        heading, reply_markup = get_books_keyboard()
+        await query.edit_message_text(heading, reply_markup=reply_markup, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    elif data == "cat_filter_syaikh":
         try:
             categories = wp_get_categories()
-            cat_map = {c["id"]: c for c in categories}
-            books = [c for c in categories if c["parent"] != 0]
-
-            if not books:
-                keyboard = [
-                    [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data="cat_new_book")],
-                    [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")],
-                ]
-                await query.edit_message_text("Belum ada buku di WordPress. Tambah baru?", reply_markup=InlineKeyboardMarkup(keyboard))
-                return ConversationHandler.END
-
+            syaikhs = [c for c in categories if c["parent"] == 0]
             keyboard = []
-            for b in books:
-                syaikh_name = cat_map.get(b["parent"], {}).get("name", "Umum")
-                label = f"📖 {b['name']} ({syaikh_name})"
-                keyboard.append([InlineKeyboardButton(label[:50], callback_data=f"cat_set_{b['id']}_{b['parent']}")])
-            keyboard.append([InlineKeyboardButton("⏩ Tanpa Buku", callback_data="cat_skip")])
+            for s in syaikhs:
+                keyboard.append([InlineKeyboardButton(f"👤 {s['name']}", callback_data=f"cat_syaikh_filter_{s['id']}")])
+            keyboard.append([InlineKeyboardButton("📚 Semua Buku", callback_data="cat_show_all_books")])
 
-            await query.edit_message_text("Pilih Buku untuk kajian ini:", reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text("Pilih Syaikh untuk menyaring daftar buku:", reply_markup=InlineKeyboardMarkup(keyboard))
             return ConversationHandler.END
-
         except Exception as exc:
-            log.exception("Failed fetching categories")
-            await query.edit_message_text(f"⚠️ Gagal mengambil kategori dari WP: {exc}")
+            log.exception("Failed fetching Syaikh filter list")
+            await query.edit_message_text(f"⚠️ Gagal mengambil daftar Syaikh: {exc}")
             return ConversationHandler.END
+
+    elif data.startswith("cat_syaikh_filter_"):
+        syaikh_id = int(data.split("_")[3])
+        heading, reply_markup = get_books_keyboard(syaikh_filter_id=syaikh_id)
+        await query.edit_message_text(heading, reply_markup=reply_markup, parse_mode="Markdown")
+        return ConversationHandler.END
 
     elif data.startswith("cat_set_"):
         parts = data.split("_")
