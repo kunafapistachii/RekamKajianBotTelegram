@@ -24,10 +24,22 @@ services:
   # -------------------------------------------------------------------------
   kajian-bot:
     build: .
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
-      # Point at the sibling service by its compose service name
-      LOCAL_API_URL: http://telegram-bot-api:8081
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      LOCAL_API_URL: ${LOCAL_API_URL:-http://telegram-bot-api:8081}
+      WP_SITE_URL: ${WP_SITE_URL}
+      WP_USER: ${WP_USER}
+      WP_APP_PASSWORD: ${WP_APP_PASSWORD}
+      WP_POST_STATUS: ${WP_POST_STATUS:-publish}
+      AUDIO_CODEC: ${AUDIO_CODEC:-libopus}
+      AUDIO_BITRATE: ${AUDIO_BITRATE:-48k}
+      AUDIO_CHANNELS: ${AUDIO_CHANNELS:-1}
+      OUTPUT_EXT: ${OUTPUT_EXT:-opus}
     depends_on:
       - telegram-bot-api
     restart: unless-stopped
