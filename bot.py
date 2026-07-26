@@ -2,7 +2,8 @@
 Telegram → ffmpeg → WordPress pipeline.
 
 Receives audio/voice files from a private Telegram bot, compresses them,
-uploads to WordPress Media Library, creates a post, and replies with the URL.
+uploads to WordPress Media Library, organizes into Syaikh & Book categories,
+creates a post, and replies with the URL.
 
 Dependencies: python-telegram-bot[job-queue]>=21, requests
 Runtime deps: ffmpeg must be on PATH inside the container.
@@ -17,8 +18,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 # ---------------------------------------------------------------------------
 # Logging — stdlib only
@@ -46,6 +54,9 @@ AUDIO_BITRATE    = os.environ.get("AUDIO_BITRATE", "48k")
 AUDIO_CHANNELS   = os.environ.get("AUDIO_CHANNELS", "1")       # 1 = mono
 OUTPUT_EXT       = os.environ.get("OUTPUT_EXT", "opus")        # opus or mp3
 
+# Conversation states
+WAITING_BOOK_TITLE, WAITING_SYAIKH_AND_BOOK = range(2)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,7 +68,7 @@ def slugify(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_]+", "-", text)
     text = re.sub(r"-+", "-", text)
-    return text[:80]  # cap length so filenames don't explode
+    return text[:80]
 
 
 def make_filename(caption: str | None, ts: datetime) -> tuple[str, str]:
@@ -86,7 +97,7 @@ def compress_audio(src: Path, dest: Path) -> None:
     cmd = [
         "ffmpeg", "-y",
         "-i", str(src),
-        "-vn",                          # drop video stream if any
+        "-vn",
         "-c:a", AUDIO_CODEC,
         "-b:a", AUDIO_BITRATE,
         "-ac", AUDIO_CHANNELS,
@@ -100,13 +111,7 @@ def compress_audio(src: Path, dest: Path) -> None:
 
 
 def wp_upload_media(file_path: Path, filename: str) -> dict:
-    """
-    Upload file to WP Media Library via REST API.
-    Uses HTTP Basic Auth with a WordPress Application Password.
-
-    WP Application Password: generate under Users → Profile → Application Passwords.
-    Format "username:xxxx xxxx xxxx xxxx xxxx xxxx" — spaces are fine, requests encodes them.
-    """
+    """Upload file to WP Media Library via REST API."""
     url  = f"{WP_SITE_URL}/wp-json/wp/v2/media"
     mime = "audio/ogg" if OUTPUT_EXT == "opus" else "audio/mpeg"
 
@@ -125,12 +130,36 @@ def wp_upload_media(file_path: Path, filename: str) -> dict:
     return resp.json()
 
 
-def wp_create_post(title: str, media_id: int, media_url: str) -> str:
-    """
-    Create a WP post with a native Gutenberg audio block.
-    Returns the published post URL.
-    """
-    # Native WordPress audio block — no plugin required
+def wp_get_categories() -> list[dict]:
+    """Fetch all categories from WP REST API."""
+    url = f"{WP_SITE_URL}/wp-json/wp/v2/categories?per_page=100"
+    resp = requests.get(
+        url,
+        auth=(WP_USER, WP_APP_PASSWORD),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wp_create_category(name: str, parent_id: int | None = None) -> dict:
+    """Create a WP Category (or Subcategory if parent_id provided)."""
+    url = f"{WP_SITE_URL}/wp-json/wp/v2/categories"
+    payload = {"name": name}
+    if parent_id:
+        payload["parent"] = parent_id
+    resp = requests.post(
+        url,
+        auth=(WP_USER, WP_APP_PASSWORD),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wp_create_post(title: str, media_id: int, media_url: str, category_ids: list[int] | None = None) -> str:
+    """Create a WP post with native Gutenberg audio block and categories."""
     audio_block = (
         f'<!-- wp:audio {{"id":{media_id}}} -->\n'
         f'<figure class="wp-block-audio">'
@@ -139,14 +168,18 @@ def wp_create_post(title: str, media_id: int, media_url: str) -> str:
         f'<!-- /wp:audio -->'
     )
 
+    payload = {
+        "title":   title,
+        "content": audio_block,
+        "status":  WP_POST_STATUS,
+    }
+    if category_ids:
+        payload["categories"] = category_ids
+
     resp = requests.post(
         f"{WP_SITE_URL}/wp-json/wp/v2/posts",
         auth=(WP_USER, WP_APP_PASSWORD),
-        json={
-            "title":   title,
-            "content": audio_block,
-            "status":  WP_POST_STATUS,
-        },
+        json=payload,
         timeout=30,
     )
     resp.raise_for_status()
@@ -154,22 +187,21 @@ def wp_create_post(title: str, media_id: int, media_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Telegram handler
+# Telegram Handlers
 # ---------------------------------------------------------------------------
 
-async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg   = update.message
-    audio = msg.voice or msg.audio   # covers both Voice messages and Audio files
+    audio = msg.voice or msg.audio
     if not audio:
-        return
+        return ConversationHandler.END
 
     ts = msg.date.replace(tzinfo=timezone.utc)
     stem, title = make_filename(msg.caption, ts)
     out_filename = f"{stem}.{OUTPUT_EXT}"
 
-    await msg.reply_text("⏳ Sedang diproses…")
+    status_msg = await msg.reply_text("⏳ Sedang memproses audio...")
 
-    # tempfile.TemporaryDirectory auto-deletes on exit (success or exception)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         src_ext  = Path(audio.file_name).suffix if getattr(audio, "file_name", None) else ".ogg"
@@ -177,9 +209,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         out_path = tmp / out_filename
 
         try:
-            # Download via Local Bot API Server.
-            # The Application is built with local_mode=True so PTB routes
-            # file downloads through LOCAL_API_URL, not api.telegram.org.
             tg_file = await audio.get_file()
             await tg_file.download_to_drive(src_path)
             log.info("Downloaded %s → %s", audio.file_id, src_path)
@@ -187,29 +216,176 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             compress_audio(src_path, out_path)
             log.info("Compressed → %s (%.1f KB)", out_filename, out_path.stat().st_size / 1024)
 
-            media    = wp_upload_media(out_path, out_filename)
-            post_url = wp_create_post(title, media["id"], media["source_url"])
+            media = wp_upload_media(out_path, out_filename)
+            context.user_data["pending_post"] = {
+                "media_id": media["id"],
+                "media_url": media["source_url"],
+                "title": title,
+            }
 
-            log.info("Post created: %s", post_url)
-            await msg.reply_text(f"✅ Kajian tayang: {post_url}")
-
-        except subprocess.CalledProcessError as exc:
-            short = (exc.output or "")[:200]
-            log.exception("ffmpeg failed")
-            await msg.reply_text(
-                f"⚠️ Gagal memproses file: {short}\n"
-                "File asli belum terhapus, coba kirim ulang."
+            keyboard = [
+                [InlineKeyboardButton("📚 Pilih Buku Existing", callback_data="cat_select_book")],
+                [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data="cat_new_book")],
+                [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await status_msg.edit_text(
+                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n\nPilih kategori kajian untuk postingan ini:",
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
             )
+            return ConversationHandler.END
 
-        except requests.HTTPError as exc:
-            log.exception("WordPress API error")
-            await msg.reply_text(
-                f"⚠️ WordPress error: {exc.response.status_code} — {exc.response.text[:200]}"
-            )
-
-        except Exception as exc:  # noqa: BLE001 — catch-all for Telegram reply
+        except Exception as exc:
             log.exception("Unexpected error: %s", exc)
-            await msg.reply_text(f"⚠️ Error tidak terduga ({type(exc).__name__}): {exc}")
+            await status_msg.edit_text(f"⚠️ Error tidak terduga ({type(exc).__name__}): {exc}")
+            return ConversationHandler.END
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    pending = context.user_data.get("pending_post")
+
+    if not pending and not data.startswith("cat_newsyaikh_"):
+        await query.edit_message_text("⚠️ Data postingan tidak ditemukan atau sudah diproses. Silakan kirim audio ulang.")
+        return ConversationHandler.END
+
+    if data == "cat_skip":
+        try:
+            post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"])
+            await query.edit_message_text(f"✅ Kajian tayang: {post_url}")
+        except Exception as exc:
+            log.exception("Failed creating post")
+            await query.edit_message_text(f"⚠️ Gagal membuat post: {exc}")
+        context.user_data.pop("pending_post", None)
+        return ConversationHandler.END
+
+    elif data == "cat_select_book":
+        try:
+            categories = wp_get_categories()
+            cat_map = {c["id"]: c for c in categories}
+            books = [c for c in categories if c["parent"] != 0]
+
+            if not books:
+                keyboard = [
+                    [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data="cat_new_book")],
+                    [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")],
+                ]
+                await query.edit_message_text("Belum ada buku di WordPress. Tambah baru?", reply_markup=InlineKeyboardMarkup(keyboard))
+                return ConversationHandler.END
+
+            keyboard = []
+            for b in books:
+                syaikh_name = cat_map.get(b["parent"], {}).get("name", "Umum")
+                label = f"📖 {b['name']} ({syaikh_name})"
+                keyboard.append([InlineKeyboardButton(label[:50], callback_data=f"cat_set_{b['id']}_{b['parent']}")])
+            keyboard.append([InlineKeyboardButton("⏩ Tanpa Buku", callback_data="cat_skip")])
+
+            await query.edit_message_text("Pilih Buku untuk kajian ini:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return ConversationHandler.END
+
+        except Exception as exc:
+            log.exception("Failed fetching categories")
+            await query.edit_message_text(f"⚠️ Gagal mengambil kategori dari WP: {exc}")
+            return ConversationHandler.END
+
+    elif data.startswith("cat_set_"):
+        parts = data.split("_")
+        book_id, syaikh_id = int(parts[2]), int(parts[3])
+        category_ids = [book_id]
+        if syaikh_id:
+            category_ids.append(syaikh_id)
+
+        try:
+            post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"], category_ids=category_ids)
+            await query.edit_message_text(f"✅ Kajian tayang: {post_url}")
+        except Exception as exc:
+            log.exception("Failed creating post")
+            await query.edit_message_text(f"⚠️ Gagal membuat post: {exc}")
+
+        context.user_data.pop("pending_post", None)
+        return ConversationHandler.END
+
+    elif data == "cat_new_book":
+        try:
+            categories = wp_get_categories()
+            syaikhs = [c for c in categories if c["parent"] == 0]
+            keyboard = []
+            for s in syaikhs:
+                keyboard.append([InlineKeyboardButton(f"👤 {s['name']}", callback_data=f"cat_newsyaikh_select_{s['id']}")])
+            keyboard.append([InlineKeyboardButton("➕ Syaikh Baru", callback_data="cat_newsyaikh_create")])
+
+            await query.edit_message_text("Pilih Syaikh yang mengajar atau buat Syaikh baru:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return ConversationHandler.END
+
+        except Exception as exc:
+            log.exception("Failed fetching Syaikh list")
+            await query.edit_message_text(f"⚠️ Gagal mengambil daftar Syaikh: {exc}")
+            return ConversationHandler.END
+
+    elif data.startswith("cat_newsyaikh_select_"):
+        syaikh_id = int(data.split("_")[3])
+        context.user_data["new_book_syaikh_id"] = syaikh_id
+        await query.edit_message_text("Silakan ketik **Judul Buku Baru** yang ingin ditambahkan:")
+        return WAITING_BOOK_TITLE
+
+    elif data == "cat_newsyaikh_create":
+        await query.edit_message_text("Silakan ketik **Nama Syaikh** & **Judul Buku** baru\n(Format: `Nama Syaikh | Judul Buku`):", parse_mode="Markdown")
+        return WAITING_SYAIKH_AND_BOOK
+
+    return ConversationHandler.END
+
+
+async def handle_input_book_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    book_title = update.message.text.strip()
+    syaikh_id = context.user_data.get("new_book_syaikh_id")
+    pending = context.user_data.get("pending_post")
+
+    if not pending or not syaikh_id:
+        await update.message.reply_text("⚠️ Sesi habis atau data tidak valid. Silakan kirim audio lagi.")
+        return ConversationHandler.END
+
+    try:
+        new_book_cat = wp_create_category(book_title, parent_id=syaikh_id)
+        cat_ids = [new_book_cat["id"], syaikh_id]
+        post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"], category_ids=cat_ids)
+        await update.message.reply_text(f"✅ Buku baru '{book_title}' dibuat!\n✅ Kajian tayang: {post_url}")
+    except Exception as exc:
+        log.exception("Failed creating book category")
+        await update.message.reply_text(f"⚠️ Gagal membuat kategori buku: {exc}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_input_syaikh_and_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    pending = context.user_data.get("pending_post")
+
+    if not pending:
+        await update.message.reply_text("⚠️ Sesi habis. Silakan kirim audio lagi.")
+        return ConversationHandler.END
+
+    if "|" not in text:
+        await update.message.reply_text("⚠️ Format salah! Gunakan format: `Nama Syaikh | Judul Buku`\nContoh: `Syaikh Al-Utsaimin | Syarah Kitabut Tauhid`", parse_mode="Markdown")
+        return WAITING_SYAIKH_AND_BOOK
+
+    syaikh_name, book_title = [p.strip() for p in text.split("|", 1)]
+
+    try:
+        syaikh_cat = wp_create_category(syaikh_name)
+        book_cat = wp_create_category(book_title, parent_id=syaikh_cat["id"])
+        cat_ids = [book_cat["id"], syaikh_cat["id"]]
+        post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"], category_ids=cat_ids)
+        await update.message.reply_text(f"✅ Syaikh '{syaikh_name}' & Buku '{book_title}' dibuat!\n✅ Kajian tayang: {post_url}")
+    except Exception as exc:
+        log.exception("Failed creating Syaikh & Book categories")
+        await update.message.reply_text(f"⚠️ Gagal membuat kategori: {exc}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +393,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Build the app pointed at the Local Bot API Server.
-    # local_mode=True: PTB skips api.telegram.org and uses LOCAL_API_URL for
-    # both API calls and file downloads (no 20 MB cap, up to 2 GB).
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -229,12 +402,29 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(
-        MessageHandler(filters.AUDIO | filters.VOICE, handle_audio)
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.AUDIO | filters.VOICE, handle_audio),
+            CallbackQueryHandler(handle_callback_query),
+        ],
+        states={
+            WAITING_BOOK_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_book_title)
+            ],
+            WAITING_SYAIKH_AND_BOOK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_syaikh_and_book)
+            ],
+        },
+        fallbacks=[],
+        per_user=True,
+        per_message=False,
     )
 
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
+
     log.info("Bot starting (local API: %s)", LOCAL_API_URL)
-    app.run_polling(allowed_updates=["message"])
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
