@@ -59,6 +59,21 @@ OUTPUT_EXT       = os.environ.get("OUTPUT_EXT", "opus")        # opus or mp3
 # Conversation states
 WAITING_BOOK_TITLE, WAITING_SYAIKH_AND_BOOK = range(2)
 
+MONTH_MAP = {
+    "jan": 1, "januari": 1, "january": 1,
+    "feb": 2, "februari": 2, "february": 2,
+    "mar": 3, "maret": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "mei": 5, "may": 5,
+    "jun": 6, "juni": 6, "june": 6,
+    "jul": 7, "juli": 7, "july": 7,
+    "agu": 8, "agustus": 8, "aug": 8, "august": 8,
+    "sep": 9, "september": 9,
+    "okt": 10, "oktober": 10, "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "des": 12, "desember": 12, "dec": 12, "december": 12,
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -91,55 +106,110 @@ def make_filename(caption: str | None, ts: datetime) -> tuple[str, str]:
     return stem, title
 
 
-def extract_date_from_text(text: str) -> datetime | None:
-    """Parse date/time from filename or text like '20260725_143000' or '2026-07-25_14-30-00'."""
+def extract_date_from_text(text: str) -> tuple[datetime, str] | None:
+    """Parse date/time from filename or text using various international & Indonesian patterns."""
     if not text:
         return None
 
-    # 1. YYYY-MM-DD[_ -T]HH-MM-SS or YYYYMMDD[_ -T]HHMMSS
+    # Pattern 1: ISO/Standard YYYY-MM-DD[_ -T]HH-MM-SS or YYYYMMDD[_ -T]HHMMSS
     m = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[\s\-_T]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})", text)
     if m:
         try:
             year, month, day, hour, minute, second = map(int, m.groups())
             if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
                 dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
-                log.info("Parsed datetime '%s' from text '%s'", dt, text)
-                return dt
+                return dt, "Pattern YYYY-MM-DD HH:MM:SS"
         except ValueError:
             pass
 
-    # 2. YYYY-MM-DD or YYYYMMDD
+    # Pattern 2: DD-MM-YYYY[_ -T]HH-MM-SS or DD/MM/YYYY
+    m = re.search(r"(\d{1,2})[-_\./](\d{1,2})[-_\./](\d{4})(?:[\s\-_T]?(\d{2})[-_]?(\d{2})[-_]?(\d{2}))?", text)
+    if m:
+        try:
+            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            hour = int(m.group(4)) if m.group(4) else 12
+            minute = int(m.group(5)) if m.group(5) else 0
+            second = int(m.group(6)) if m.group(6) else 0
+            if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+                dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+                return dt, "Pattern DD-MM-YYYY"
+        except ValueError:
+            pass
+
+    # Pattern 3: YYYY-MM-DD or YYYYMMDD
     m = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", text)
     if m:
         try:
             year, month, day = map(int, m.groups())
             if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
                 dt = datetime(year, month, day, 12, 0, 0, tzinfo=timezone.utc)
-                log.info("Parsed date '%s' from text '%s'", dt, text)
-                return dt
+                return dt, "Pattern YYYY-MM-DD"
+        except ValueError:
+            pass
+
+    # Pattern 4: Indonesian/English named date like '22 Juli 2026' or '22-Juli-2026'
+    m = re.search(r"(\d{1,2})[\s\-_]+([a-zA-Z]+)[\s\-_]+(\d{4})", text)
+    if m:
+        try:
+            day = int(m.group(1))
+            month_str = m.group(2).lower()
+            year = int(m.group(3))
+            if month_str in MONTH_MAP and 1 <= day <= 31 and 2000 <= year <= 2100:
+                month = MONTH_MAP[month_str]
+                dt = datetime(year, month, day, 12, 0, 0, tzinfo=timezone.utc)
+                return dt, f"Pattern DD Month YYYY ({month_str})"
         except ValueError:
             pass
 
     return None
 
 
-def get_file_timestamp(src_path: Path, filename: str | None, caption: str | None, default_ts: datetime) -> datetime:
-    """Extract audio creation/recording time from filename, caption, ffprobe tags, or mtime."""
-    # 1. Try extracting date from original file_name (e.g. AUD-20260725-WA0001.m4a or Record_20260725_143000.m4a)
+def get_file_timestamp(
+    tg_file_path: str | None,
+    src_path: Path,
+    filename: str | None,
+    caption: str | None,
+    default_ts: datetime,
+) -> tuple[datetime, str]:
+    """
+    Extract audio creation/recording time from:
+    1. File mtime of tg_file_path or src_path (if earlier than upload time)
+    2. Original filename (e.g. Record_20260722_143000.m4a)
+    3. Caption text
+    4. ffprobe metadata tags
+    5. Fallback to Telegram upload date
+    """
+    # 1. Check file modification time (mtime) of the original file on disk
+    for path_obj in [Path(tg_file_path) if tg_file_path else None, src_path]:
+        if path_obj and path_obj.exists():
+            try:
+                mtime = path_obj.stat().st_mtime
+                if mtime > 0:
+                    mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+                    # If file mtime is earlier than upload time (by > 60 seconds), it's the recording date!
+                    if (default_ts - mtime_dt).total_seconds() > 60:
+                        log.info("Found file mtime earlier than upload time: %s", mtime_dt)
+                        return mtime_dt, f"File MTime ({mtime_dt.strftime('%Y-%m-%d %H:%M')})"
+            except Exception as exc:
+                log.warning("Failed checking mtime for %s: %s", path_obj, exc)
+
+    # 2. Check original filename
     if filename:
-        dt = extract_date_from_text(filename)
-        if dt:
-            log.info("Using recording timestamp extracted from filename '%s': %s", filename, dt)
-            return dt
+        res = extract_date_from_text(filename)
+        if res:
+            dt, src_name = res
+            log.info("Found timestamp in filename '%s': %s", filename, dt)
+            return dt, f"Filename ({filename})"
 
-    # 2. Try extracting date from caption text
+    # 3. Check caption text
     if caption:
-        dt = extract_date_from_text(caption)
-        if dt:
-            log.info("Using recording timestamp extracted from caption '%s': %s", caption, dt)
-            return dt
+        res = extract_date_from_text(caption)
+        if res:
+            dt, src_name = res
+            log.info("Found timestamp in caption '%s': %s", caption, dt)
+            return dt, "Caption Text"
 
-    # 3. Check ffprobe for creation_time or ANY format tag containing date
+    # 4. Check ffprobe tags
     try:
         cmd = [
             "ffprobe", "-v", "quiet",
@@ -160,18 +230,19 @@ def get_file_timestamp(src_path: Path, filename: str | None, caption: str | None
                     if not dt.tzinfo:
                         dt = dt.replace(tzinfo=timezone.utc)
                     log.info("Extracted recording timestamp from ffprobe tag '%s' (%s): %s", key, val, dt)
-                    return dt
+                    return dt, f"Audio Tag ({key})"
                 except ValueError:
-                    dt = extract_date_from_text(val_str)
-                    if dt:
+                    parsed = extract_date_from_text(val_str)
+                    if parsed:
+                        dt, _ = parsed
                         log.info("Extracted recording timestamp from ffprobe tag '%s' (%s): %s", key, val, dt)
-                        return dt
+                        return dt, f"Audio Tag ({key})"
     except Exception as exc:
         log.warning("ffprobe timestamp extraction failed: %s", exc)
 
-    # 4. Fallback to Telegram message timestamp
-    log.info("Using Telegram message timestamp: %s", default_ts)
-    return default_ts
+    # 5. Fallback
+    log.info("Using Telegram upload date fallback: %s", default_ts)
+    return default_ts, "Telegram Upload Date (Fallback)"
 
 
 def compress_audio(src: Path, dest: Path) -> None:
@@ -345,7 +416,14 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             log.info("Downloaded %s → %s", audio.file_id, src_path)
 
             orig_filename = getattr(audio, "file_name", None)
-            rec_ts = get_file_timestamp(src_path, filename=orig_filename, caption=msg.caption, default_ts=msg_ts)
+            rec_ts, ts_source = get_file_timestamp(
+                tg_file_path=getattr(tg_file, "file_path", None),
+                src_path=src_path,
+                filename=orig_filename,
+                caption=msg.caption,
+                default_ts=msg_ts,
+            )
+
             stem, title = make_filename(msg.caption, rec_ts)
             out_filename = f"{stem}.{OUTPUT_EXT}"
             out_path = tmp / out_filename
@@ -363,7 +441,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
             heading, reply_markup = get_books_keyboard()
             await status_msg.edit_text(
-                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n📅 **Waktu Rekam**: {rec_ts.strftime('%Y-%m-%d %H:%M:%S')}\n\n{heading}",
+                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n📅 **Waktu Rekam**: {rec_ts.strftime('%Y-%m-%d %H:%M:%S')} *(Sumber: {ts_source})*\n\n{heading}",
                 reply_markup=reply_markup,
                 parse_mode="Markdown",
             )
