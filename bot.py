@@ -426,12 +426,18 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
         try:
             tg_file = await audio.get_file()
-            await tg_file.download_to_drive(src_path)
-            log.info("Downloaded %s → %s", audio.file_id, src_path)
+            tg_local_path = getattr(tg_file, "file_path", None)
+
+            # Use local file directly if available to save disk space and prevent 'No space left' errors
+            if tg_local_path and Path(tg_local_path).exists():
+                src_path = Path(tg_local_path)
+            else:
+                await tg_file.download_to_drive(src_path)
+                log.info("Downloaded %s → %s", audio.file_id, src_path)
 
             orig_filename = getattr(audio, "file_name", None)
             rec_ts, ts_source = get_file_timestamp(
-                tg_file_path=getattr(tg_file, "file_path", None),
+                tg_file_path=tg_local_path,
                 src_path=src_path,
                 filename=orig_filename,
                 caption=msg.caption,
@@ -453,6 +459,14 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "title": title,
                 "post_date": rec_ts.isoformat(),
             }
+
+            # Cleanup raw file from telegram-bot-api volume so disk never fills up
+            if tg_local_path and Path(tg_local_path).exists():
+                try:
+                    Path(tg_local_path).unlink(missing_ok=True)
+                    log.info("Cleaned up raw telegram-bot-api file: %s", tg_local_path)
+                except Exception as clean_err:
+                    log.warning("Could not clean raw file %s: %s", tg_local_path, clean_err)
 
             heading, reply_markup = get_books_keyboard(msg_id)
             await status_msg.edit_text(
