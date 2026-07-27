@@ -94,7 +94,7 @@ def make_filename(caption: str | None, ts: datetime) -> tuple[str, str]:
     Filename: kajian_YYYY-MM-DD_HH-MM-SS[_slugified-title]
     """
     ts_str  = ts.strftime("%Y-%m-%d_%H-%M-%S")
-    ts_disp = ts.strftime("%Y-%m-%d %H:%M")
+    ts_disp = ts.strftime("%Y-%m-%d")
 
     if caption and caption.strip():
         title = caption.strip()
