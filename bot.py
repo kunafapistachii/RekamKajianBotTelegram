@@ -107,11 +107,24 @@ def make_filename(caption: str | None, ts: datetime) -> tuple[str, str]:
 
 
 def extract_date_from_text(text: str) -> tuple[datetime, str] | None:
-    """Parse date/time from filename or text using various international & Indonesian patterns."""
+    """Parse date/time from filename or text using various patterns."""
     if not text:
         return None
 
-    # Pattern 1: ISO/Standard YYYY-MM-DD[_ -T]HH-MM-SS or YYYYMMDD[_ -T]HHMMSS
+    # Pattern 0: Samsung / Android Voice Recorder format: YYMMDD_HHMMSS (e.g. Voice 260721_200611.m4a)
+    m = re.search(r"(\d{2})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})", text)
+    if m:
+        try:
+            yy, month, day, hour, minute, second = map(int, m.groups())
+            year = 2000 + yy
+            if 2020 <= year <= 2035 and 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+                dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+                log.info("Parsed Samsung Voice YYMMDD_HHMMSS date '%s' from text '%s'", dt, text)
+                return dt, "Samsung Voice (YYMMDD_HHMMSS)"
+        except ValueError:
+            pass
+
+    # Pattern 1: ISO 4-digit year YYYY-MM-DD[_ -T]HH-MM-SS or YYYYMMDD[_ -T]HHMMSS
     m = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[\s\-_T]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})", text)
     if m:
         try:
@@ -173,13 +186,29 @@ def get_file_timestamp(
 ) -> tuple[datetime, str]:
     """
     Extract audio creation/recording time from:
-    1. File mtime of tg_file_path or src_path (if earlier than upload time)
-    2. Original filename (e.g. Record_20260722_143000.m4a)
-    3. Caption text
+    1. Original filename (e.g. Voice 260721_200611.m4a or Record_20260722_143000.m4a)
+    2. Caption text
+    3. File mtime of tg_file_path or src_path (if earlier than upload time)
     4. ffprobe metadata tags
     5. Fallback to Telegram upload date
     """
-    # 1. Check file modification time (mtime) of the original file on disk
+    # 1. Check original filename FIRST
+    if filename:
+        res = extract_date_from_text(filename)
+        if res:
+            dt, src_name = res
+            log.info("Found timestamp in filename '%s': %s", filename, dt)
+            return dt, f"Filename ({filename})"
+
+    # 2. Check caption text SECOND
+    if caption:
+        res = extract_date_from_text(caption)
+        if res:
+            dt, src_name = res
+            log.info("Found timestamp in caption '%s': %s", caption, dt)
+            return dt, "Caption Text"
+
+    # 3. Check file modification time (mtime) of the original file on disk
     for path_obj in [Path(tg_file_path) if tg_file_path else None, src_path]:
         if path_obj and path_obj.exists():
             try:
@@ -192,22 +221,6 @@ def get_file_timestamp(
                         return mtime_dt, f"File MTime ({mtime_dt.strftime('%Y-%m-%d %H:%M')})"
             except Exception as exc:
                 log.warning("Failed checking mtime for %s: %s", path_obj, exc)
-
-    # 2. Check original filename
-    if filename:
-        res = extract_date_from_text(filename)
-        if res:
-            dt, src_name = res
-            log.info("Found timestamp in filename '%s': %s", filename, dt)
-            return dt, f"Filename ({filename})"
-
-    # 3. Check caption text
-    if caption:
-        res = extract_date_from_text(caption)
-        if res:
-            dt, src_name = res
-            log.info("Found timestamp in caption '%s': %s", caption, dt)
-            return dt, "Caption Text"
 
     # 4. Check ffprobe tags
     try:
@@ -351,7 +364,7 @@ def wp_create_post(
     return resp.json()["link"]
 
 
-def get_books_keyboard(syaikh_filter_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
+def get_books_keyboard(msg_id: int, syaikh_filter_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
     """Build keyboard showing list of Books directly by default."""
     try:
         categories = wp_get_categories()
@@ -369,25 +382,25 @@ def get_books_keyboard(syaikh_filter_id: int | None = None) -> tuple[str, Inline
         for b in books:
             parent_name = cat_map.get(b["parent"], {}).get("name", "Umum")
             label = f"📖 {b['name']} ({parent_name})"
-            keyboard.append([InlineKeyboardButton(label[:50], callback_data=f"cat_set_{b['id']}_{b['parent']}")])
+            keyboard.append([InlineKeyboardButton(label[:50], callback_data=f"cat_set_{msg_id}_{b['id']}_{b['parent']}")])
 
         action_row = []
         if syaikh_filter_id:
-            action_row.append(InlineKeyboardButton("📚 Semua Buku", callback_data="cat_show_all_books"))
+            action_row.append(InlineKeyboardButton("📚 Semua Buku", callback_data=f"cat_allbooks_{msg_id}"))
         else:
-            action_row.append(InlineKeyboardButton("👤 Filter per Syaikh", callback_data="cat_filter_syaikh"))
+            action_row.append(InlineKeyboardButton("👤 Filter per Syaikh", callback_data=f"cat_filtersyaikh_{msg_id}"))
 
-        action_row.append(InlineKeyboardButton("➕ Buku Baru", callback_data="cat_new_book"))
+        action_row.append(InlineKeyboardButton("➕ Buku Baru", callback_data=f"cat_newbook_{msg_id}"))
         keyboard.append(action_row)
 
-        keyboard.append([InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")])
+        keyboard.append([InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data=f"cat_skip_{msg_id}")])
 
         return heading, InlineKeyboardMarkup(keyboard)
     except Exception as exc:
         log.exception("Failed to build books keyboard: %s", exc)
         keyboard = [
-            [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data="cat_new_book")],
-            [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data="cat_skip")],
+            [InlineKeyboardButton("➕ Tambah Buku Baru", callback_data=f"cat_newbook_{msg_id}")],
+            [InlineKeyboardButton("⏩ Tanpa Buku (Umum)", callback_data=f"cat_skip_{msg_id}")],
         ]
         return "Pilih opsi kategori:", InlineKeyboardMarkup(keyboard)
 
@@ -404,6 +417,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     msg_ts = msg.date.replace(tzinfo=timezone.utc)
     status_msg = await msg.reply_text("⏳ Sedang memproses audio...")
+    msg_id = status_msg.message_id
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -432,14 +446,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             log.info("Compressed → %s (%.1f KB)", out_filename, out_path.stat().st_size / 1024)
 
             media = wp_upload_media(out_path, out_filename)
-            context.user_data["pending_post"] = {
+            pending_posts = context.user_data.setdefault("pending_posts", {})
+            pending_posts[msg_id] = {
                 "media_id": media["id"],
                 "media_url": media["source_url"],
                 "title": title,
                 "post_date": rec_ts.isoformat(),
             }
 
-            heading, reply_markup = get_books_keyboard()
+            heading, reply_markup = get_books_keyboard(msg_id)
             await status_msg.edit_text(
                 f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n📅 **Waktu Rekam**: {rec_ts.strftime('%Y-%m-%d %H:%M:%S')} *(Sumber: {ts_source})*\n\n{heading}",
                 reply_markup=reply_markup,
@@ -462,15 +477,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
-    pending = context.user_data.get("pending_post")
 
-    if not pending and not data.startswith("cat_newsyaikh_"):
-        await query.edit_message_text("⚠️ Data postingan tidak ditemukan atau sudah diproses. Silakan kirim audio ulang.")
+    parts = data.split("_")
+    if len(parts) < 3:
+        return ConversationHandler.END
+
+    action = parts[1]
+    try:
+        msg_id = int(parts[2])
+    except ValueError:
+        return ConversationHandler.END
+
+    pending_posts = context.user_data.get("pending_posts", {})
+    pending = pending_posts.get(msg_id)
+
+    if not pending and not action.startswith("newsyaikh"):
+        await query.edit_message_text("⚠️ Data postingan ini tidak ditemukan atau sudah diproses. Silakan kirim audio ulang.")
         return ConversationHandler.END
 
     post_date = datetime.fromisoformat(pending["post_date"]) if pending and pending.get("post_date") else None
 
-    if data == "cat_skip":
+    if action == "skip":
         try:
             post_url = wp_create_post(
                 pending["title"],
@@ -482,22 +509,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as exc:
             log.exception("Failed creating post")
             await query.edit_message_text(f"⚠️ Gagal membuat post: {exc}")
-        context.user_data.pop("pending_post", None)
+        pending_posts.pop(msg_id, None)
         return ConversationHandler.END
 
-    elif data == "cat_show_all_books":
-        heading, reply_markup = get_books_keyboard()
+    elif action == "allbooks":
+        heading, reply_markup = get_books_keyboard(msg_id)
         await query.edit_message_text(heading, reply_markup=reply_markup, parse_mode="Markdown")
         return ConversationHandler.END
 
-    elif data == "cat_filter_syaikh":
+    elif action == "filtersyaikh":
         try:
             categories = wp_get_categories()
             syaikhs = [c for c in categories if c["parent"] == 0]
             keyboard = []
             for s in syaikhs:
-                keyboard.append([InlineKeyboardButton(f"👤 {s['name']}", callback_data=f"cat_syaikh_filter_{s['id']}")])
-            keyboard.append([InlineKeyboardButton("📚 Semua Buku", callback_data="cat_show_all_books")])
+                keyboard.append([InlineKeyboardButton(f"👤 {s['name']}", callback_data=f"cat_syaikhfilter_{msg_id}_{s['id']}")])
+            keyboard.append([InlineKeyboardButton("📚 Semua Buku", callback_data=f"cat_allbooks_{msg_id}")])
 
             await query.edit_message_text("Pilih Syaikh untuk menyaring daftar buku:", reply_markup=InlineKeyboardMarkup(keyboard))
             return ConversationHandler.END
@@ -506,15 +533,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"⚠️ Gagal mengambil daftar Syaikh: {exc}")
             return ConversationHandler.END
 
-    elif data.startswith("cat_syaikh_filter_"):
-        syaikh_id = int(data.split("_")[3])
-        heading, reply_markup = get_books_keyboard(syaikh_filter_id=syaikh_id)
+    elif action == "syaikhfilter":
+        syaikh_id = int(parts[3])
+        heading, reply_markup = get_books_keyboard(msg_id, syaikh_filter_id=syaikh_id)
         await query.edit_message_text(heading, reply_markup=reply_markup, parse_mode="Markdown")
         return ConversationHandler.END
 
-    elif data.startswith("cat_set_"):
-        parts = data.split("_")
-        book_id, syaikh_id = int(parts[2]), int(parts[3])
+    elif action == "set":
+        book_id, syaikh_id = int(parts[3]), int(parts[4])
         category_ids = [book_id]
         if syaikh_id:
             category_ids.append(syaikh_id)
@@ -532,17 +558,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             log.exception("Failed creating post")
             await query.edit_message_text(f"⚠️ Gagal membuat post: {exc}")
 
-        context.user_data.pop("pending_post", None)
+        pending_posts.pop(msg_id, None)
         return ConversationHandler.END
 
-    elif data == "cat_new_book":
+    elif action == "newbook":
         try:
             categories = wp_get_categories()
             syaikhs = [c for c in categories if c["parent"] == 0]
             keyboard = []
             for s in syaikhs:
-                keyboard.append([InlineKeyboardButton(f"👤 {s['name']}", callback_data=f"cat_newsyaikh_select_{s['id']}")])
-            keyboard.append([InlineKeyboardButton("➕ Syaikh Baru", callback_data="cat_newsyaikh_create")])
+                keyboard.append([InlineKeyboardButton(f"👤 {s['name']}", callback_data=f"cat_newsyaikhselect_{msg_id}_{s['id']}")])
+            keyboard.append([InlineKeyboardButton("➕ Syaikh Baru", callback_data=f"cat_newsyaikhcreate_{msg_id}")])
 
             await query.edit_message_text("Pilih Syaikh yang mengajar atau buat Syaikh baru:", reply_markup=InlineKeyboardMarkup(keyboard))
             return ConversationHandler.END
@@ -552,13 +578,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"⚠️ Gagal mengambil daftar Syaikh: {exc}")
             return ConversationHandler.END
 
-    elif data.startswith("cat_newsyaikh_select_"):
-        syaikh_id = int(data.split("_")[3])
+    elif action == "newsyaikhselect":
+        syaikh_id = int(parts[3])
+        context.user_data["active_msg_id"] = msg_id
         context.user_data["new_book_syaikh_id"] = syaikh_id
         await query.edit_message_text("Silakan ketik **Judul Buku Baru** yang ingin ditambahkan:")
         return WAITING_BOOK_TITLE
 
-    elif data == "cat_newsyaikh_create":
+    elif action == "newsyaikhcreate":
+        context.user_data["active_msg_id"] = msg_id
         await query.edit_message_text("Silakan ketik **Nama Syaikh** & **Judul Buku** baru\n(Format: `Nama Syaikh | Judul Buku`):", parse_mode="Markdown")
         return WAITING_SYAIKH_AND_BOOK
 
@@ -568,7 +596,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_input_book_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     book_title = update.message.text.strip()
     syaikh_id = context.user_data.get("new_book_syaikh_id")
-    pending = context.user_data.get("pending_post")
+    msg_id = context.user_data.get("active_msg_id")
+    pending_posts = context.user_data.get("pending_posts", {})
+    pending = pending_posts.get(msg_id) if msg_id else None
 
     if not pending or not syaikh_id:
         await update.message.reply_text("⚠️ Sesi habis atau data tidak valid. Silakan kirim audio lagi.")
@@ -591,13 +621,16 @@ async def handle_input_book_title(update: Update, context: ContextTypes.DEFAULT_
         log.exception("Failed creating book category")
         await update.message.reply_text(f"⚠️ Gagal membuat kategori buku: {exc}")
 
-    context.user_data.clear()
+    if msg_id:
+        pending_posts.pop(msg_id, None)
     return ConversationHandler.END
 
 
 async def handle_input_syaikh_and_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    pending = context.user_data.get("pending_post")
+    msg_id = context.user_data.get("active_msg_id")
+    pending_posts = context.user_data.get("pending_posts", {})
+    pending = pending_posts.get(msg_id) if msg_id else None
 
     if not pending:
         await update.message.reply_text("⚠️ Sesi habis. Silakan kirim audio lagi.")
@@ -626,7 +659,8 @@ async def handle_input_syaikh_and_book(update: Update, context: ContextTypes.DEF
         log.exception("Failed creating Syaikh & Book categories")
         await update.message.reply_text(f"⚠️ Gagal membuat kategori: {exc}")
 
-    context.user_data.clear()
+    if msg_id:
+        pending_posts.pop(msg_id, None)
     return ConversationHandler.END
 
 
