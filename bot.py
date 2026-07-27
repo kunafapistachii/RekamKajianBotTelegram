@@ -91,50 +91,85 @@ def make_filename(caption: str | None, ts: datetime) -> tuple[str, str]:
     return stem, title
 
 
-def get_file_timestamp(src_path: Path, default_ts: datetime) -> datetime:
-    """Extract audio creation/recording time via ffprobe, falling back to mtime or default_ts."""
+def extract_date_from_text(text: str) -> datetime | None:
+    """Parse date/time from filename or text like '20260725_143000' or '2026-07-25_14-30-00'."""
+    if not text:
+        return None
+
+    # 1. YYYY-MM-DD[_ -T]HH-MM-SS or YYYYMMDD[_ -T]HHMMSS
+    m = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[\s\-_T]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})", text)
+    if m:
+        try:
+            year, month, day, hour, minute, second = map(int, m.groups())
+            if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+                dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+                log.info("Parsed datetime '%s' from text '%s'", dt, text)
+                return dt
+        except ValueError:
+            pass
+
+    # 2. YYYY-MM-DD or YYYYMMDD
+    m = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", text)
+    if m:
+        try:
+            year, month, day = map(int, m.groups())
+            if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+                dt = datetime(year, month, day, 12, 0, 0, tzinfo=timezone.utc)
+                log.info("Parsed date '%s' from text '%s'", dt, text)
+                return dt
+        except ValueError:
+            pass
+
+    return None
+
+
+def get_file_timestamp(src_path: Path, filename: str | None, caption: str | None, default_ts: datetime) -> datetime:
+    """Extract audio creation/recording time from filename, caption, ffprobe tags, or mtime."""
+    # 1. Try extracting date from original file_name (e.g. AUD-20260725-WA0001.m4a or Record_20260725_143000.m4a)
+    if filename:
+        dt = extract_date_from_text(filename)
+        if dt:
+            log.info("Using recording timestamp extracted from filename '%s': %s", filename, dt)
+            return dt
+
+    # 2. Try extracting date from caption text
+    if caption:
+        dt = extract_date_from_text(caption)
+        if dt:
+            log.info("Using recording timestamp extracted from caption '%s': %s", caption, dt)
+            return dt
+
+    # 3. Check ffprobe for creation_time or ANY format tag containing date
     try:
         cmd = [
             "ffprobe", "-v", "quiet",
             "-print_format", "json",
-            "-show_entries", "format_tags=creation_time,date,datetime,encoded_date",
+            "-show_entries", "format_tags",
             str(src_path),
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
             tags = data.get("format", {}).get("tags", {})
-            for key in ["creation_time", "date", "datetime", "encoded_date"]:
-                val = tags.get(key)
-                if val:
-                    val_str = str(val).strip().replace("Z", "+00:00")
-                    try:
-                        dt = datetime.fromisoformat(val_str)
-                        if not dt.tzinfo:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        log.info("Extracted recording timestamp from ffprobe tags (%s): %s", key, dt)
+            for key, val in tags.items():
+                if not val:
+                    continue
+                val_str = str(val).strip().replace("Z", "+00:00")
+                try:
+                    dt = datetime.fromisoformat(val_str)
+                    if not dt.tzinfo:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    log.info("Extracted recording timestamp from ffprobe tag '%s' (%s): %s", key, val, dt)
+                    return dt
+                except ValueError:
+                    dt = extract_date_from_text(val_str)
+                    if dt:
+                        log.info("Extracted recording timestamp from ffprobe tag '%s' (%s): %s", key, val, dt)
                         return dt
-                    except ValueError:
-                        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                            try:
-                                dt = datetime.strptime(val_str, fmt).replace(tzinfo=timezone.utc)
-                                log.info("Extracted recording timestamp from ffprobe tags (%s): %s", key, dt)
-                                return dt
-                            except ValueError:
-                                pass
     except Exception as exc:
         log.warning("ffprobe timestamp extraction failed: %s", exc)
 
-    try:
-        mtime = src_path.stat().st_mtime
-        if mtime > 0:
-            mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
-            if abs((default_ts - mtime_dt).total_seconds()) > 300:
-                log.info("Using file st_mtime timestamp: %s", mtime_dt)
-                return mtime_dt
-    except Exception:
-        pass
-
+    # 4. Fallback to Telegram message timestamp
     log.info("Using Telegram message timestamp: %s", default_ts)
     return default_ts
 
@@ -232,6 +267,7 @@ def wp_create_post(
     if category_ids:
         payload["categories"] = category_ids
     if post_date:
+        payload["date"]     = post_date.strftime("%Y-%m-%dT%H:%M:%S")
         payload["date_gmt"] = post_date.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     resp = requests.post(
@@ -308,7 +344,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await tg_file.download_to_drive(src_path)
             log.info("Downloaded %s → %s", audio.file_id, src_path)
 
-            rec_ts = get_file_timestamp(src_path, default_ts=msg_ts)
+            orig_filename = getattr(audio, "file_name", None)
+            rec_ts = get_file_timestamp(src_path, filename=orig_filename, caption=msg.caption, default_ts=msg_ts)
             stem, title = make_filename(msg.caption, rec_ts)
             out_filename = f"{stem}.{OUTPUT_EXT}"
             out_path = tmp / out_filename
