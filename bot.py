@@ -3,12 +3,13 @@ Telegram → ffmpeg → WordPress pipeline.
 
 Receives audio/voice files from a private Telegram bot, compresses them,
 uploads to WordPress Media Library, organizes into Syaikh & Book categories,
-creates a post, and replies with the URL.
+creates a post using the original recording timestamp, and replies with the URL.
 
 Dependencies: python-telegram-bot[job-queue]>=21, requests
-Runtime deps: ffmpeg must be on PATH inside the container.
+Runtime deps: ffmpeg and ffprobe must be on PATH inside the container.
 """
 
+import json
 import logging
 import os
 import re
@@ -90,6 +91,54 @@ def make_filename(caption: str | None, ts: datetime) -> tuple[str, str]:
     return stem, title
 
 
+def get_file_timestamp(src_path: Path, default_ts: datetime) -> datetime:
+    """Extract audio creation/recording time via ffprobe, falling back to mtime or default_ts."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_entries", "format_tags=creation_time,date,datetime,encoded_date",
+            str(src_path),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            tags = data.get("format", {}).get("tags", {})
+            for key in ["creation_time", "date", "datetime", "encoded_date"]:
+                val = tags.get(key)
+                if val:
+                    val_str = str(val).strip().replace("Z", "+00:00")
+                    try:
+                        dt = datetime.fromisoformat(val_str)
+                        if not dt.tzinfo:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        log.info("Extracted recording timestamp from ffprobe tags (%s): %s", key, dt)
+                        return dt
+                    except ValueError:
+                        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                            try:
+                                dt = datetime.strptime(val_str, fmt).replace(tzinfo=timezone.utc)
+                                log.info("Extracted recording timestamp from ffprobe tags (%s): %s", key, dt)
+                                return dt
+                            except ValueError:
+                                pass
+    except Exception as exc:
+        log.warning("ffprobe timestamp extraction failed: %s", exc)
+
+    try:
+        mtime = src_path.stat().st_mtime
+        if mtime > 0:
+            mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            if abs((default_ts - mtime_dt).total_seconds()) > 300:
+                log.info("Using file st_mtime timestamp: %s", mtime_dt)
+                return mtime_dt
+    except Exception:
+        pass
+
+    log.info("Using Telegram message timestamp: %s", default_ts)
+    return default_ts
+
+
 def compress_audio(src: Path, dest: Path) -> None:
     """
     Compress src → dest via ffmpeg.
@@ -159,8 +208,14 @@ def wp_create_category(name: str, parent_id: int | None = None) -> dict:
     return resp.json()
 
 
-def wp_create_post(title: str, media_id: int, media_url: str, category_ids: list[int] | None = None) -> str:
-    """Create a WP post with native Gutenberg audio block and categories."""
+def wp_create_post(
+    title: str,
+    media_id: int,
+    media_url: str,
+    category_ids: list[int] | None = None,
+    post_date: datetime | None = None,
+) -> str:
+    """Create a WP post with native Gutenberg audio block, categories, and recording date."""
     audio_block = (
         f'<!-- wp:audio {{"id":{media_id}}} -->\n'
         f'<figure class="wp-block-audio">'
@@ -176,6 +231,8 @@ def wp_create_post(title: str, media_id: int, media_url: str, category_ids: list
     }
     if category_ids:
         payload["categories"] = category_ids
+    if post_date:
+        payload["date_gmt"] = post_date.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     resp = requests.post(
         f"{WP_SITE_URL}/wp-json/wp/v2/posts",
@@ -207,7 +264,6 @@ def get_books_keyboard(syaikh_filter_id: int | None = None) -> tuple[str, Inline
             label = f"📖 {b['name']} ({parent_name})"
             keyboard.append([InlineKeyboardButton(label[:50], callback_data=f"cat_set_{b['id']}_{b['parent']}")])
 
-        # Action row for filtering & adding
         action_row = []
         if syaikh_filter_id:
             action_row.append(InlineKeyboardButton("📚 Semua Buku", callback_data="cat_show_all_books"))
@@ -239,22 +295,23 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not audio:
         return ConversationHandler.END
 
-    ts = msg.date.replace(tzinfo=timezone.utc)
-    stem, title = make_filename(msg.caption, ts)
-    out_filename = f"{stem}.{OUTPUT_EXT}"
-
+    msg_ts = msg.date.replace(tzinfo=timezone.utc)
     status_msg = await msg.reply_text("⏳ Sedang memproses audio...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         src_ext  = Path(audio.file_name).suffix if getattr(audio, "file_name", None) else ".ogg"
         src_path = tmp / f"raw{src_ext}"
-        out_path = tmp / out_filename
 
         try:
             tg_file = await audio.get_file()
             await tg_file.download_to_drive(src_path)
             log.info("Downloaded %s → %s", audio.file_id, src_path)
+
+            rec_ts = get_file_timestamp(src_path, default_ts=msg_ts)
+            stem, title = make_filename(msg.caption, rec_ts)
+            out_filename = f"{stem}.{OUTPUT_EXT}"
+            out_path = tmp / out_filename
 
             compress_audio(src_path, out_path)
             log.info("Compressed → %s (%.1f KB)", out_filename, out_path.stat().st_size / 1024)
@@ -264,11 +321,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "media_id": media["id"],
                 "media_url": media["source_url"],
                 "title": title,
+                "post_date": rec_ts.isoformat(),
             }
 
             heading, reply_markup = get_books_keyboard()
             await status_msg.edit_text(
-                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n\n{heading}",
+                f"✅ Audio berhasil di-upload!\n📌 **Judul**: {title}\n📅 **Waktu Rekam**: {rec_ts.strftime('%Y-%m-%d %H:%M:%S')}\n\n{heading}",
                 reply_markup=reply_markup,
                 parse_mode="Markdown",
             )
@@ -295,9 +353,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("⚠️ Data postingan tidak ditemukan atau sudah diproses. Silakan kirim audio ulang.")
         return ConversationHandler.END
 
+    post_date = datetime.fromisoformat(pending["post_date"]) if pending and pending.get("post_date") else None
+
     if data == "cat_skip":
         try:
-            post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"])
+            post_url = wp_create_post(
+                pending["title"],
+                pending["media_id"],
+                pending["media_url"],
+                post_date=post_date,
+            )
             await query.edit_message_text(f"✅ Kajian tayang: {post_url}")
         except Exception as exc:
             log.exception("Failed creating post")
@@ -340,7 +405,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             category_ids.append(syaikh_id)
 
         try:
-            post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"], category_ids=category_ids)
+            post_url = wp_create_post(
+                pending["title"],
+                pending["media_id"],
+                pending["media_url"],
+                category_ids=category_ids,
+                post_date=post_date,
+            )
             await query.edit_message_text(f"✅ Kajian tayang: {post_url}")
         except Exception as exc:
             log.exception("Failed creating post")
@@ -388,10 +459,18 @@ async def handle_input_book_title(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("⚠️ Sesi habis atau data tidak valid. Silakan kirim audio lagi.")
         return ConversationHandler.END
 
+    post_date = datetime.fromisoformat(pending["post_date"]) if pending.get("post_date") else None
+
     try:
         new_book_cat = wp_create_category(book_title, parent_id=syaikh_id)
         cat_ids = [new_book_cat["id"], syaikh_id]
-        post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"], category_ids=cat_ids)
+        post_url = wp_create_post(
+            pending["title"],
+            pending["media_id"],
+            pending["media_url"],
+            category_ids=cat_ids,
+            post_date=post_date,
+        )
         await update.message.reply_text(f"✅ Buku baru '{book_title}' dibuat!\n✅ Kajian tayang: {post_url}")
     except Exception as exc:
         log.exception("Failed creating book category")
@@ -414,12 +493,19 @@ async def handle_input_syaikh_and_book(update: Update, context: ContextTypes.DEF
         return WAITING_SYAIKH_AND_BOOK
 
     syaikh_name, book_title = [p.strip() for p in text.split("|", 1)]
+    post_date = datetime.fromisoformat(pending["post_date"]) if pending.get("post_date") else None
 
     try:
         syaikh_cat = wp_create_category(syaikh_name)
         book_cat = wp_create_category(book_title, parent_id=syaikh_cat["id"])
         cat_ids = [book_cat["id"], syaikh_cat["id"]]
-        post_url = wp_create_post(pending["title"], pending["media_id"], pending["media_url"], category_ids=cat_ids)
+        post_url = wp_create_post(
+            pending["title"],
+            pending["media_id"],
+            pending["media_url"],
+            category_ids=cat_ids,
+            post_date=post_date,
+        )
         await update.message.reply_text(f"✅ Syaikh '{syaikh_name}' & Buku '{book_title}' dibuat!\n✅ Kajian tayang: {post_url}")
     except Exception as exc:
         log.exception("Failed creating Syaikh & Book categories")
